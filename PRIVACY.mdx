@@ -1,0 +1,331 @@
+---
+title: Privacy Architecture
+description: "The zero-knowledge model — what the server stores, what it refuses to store, and how encryption is enforced."
+---
+
+## The promise
+
+inchambers.ai is built around a single, concrete privacy promise: **the server never stores or logs document content, AI prompts, AI responses, or provider API keys — in any deployment shape.**
+
+In the BYOK, firm-gateway, and client-side paths the content never transits inchambers at all. In the platform gateway path (free and platform tiers) content is streamed through a relay to the AI provider and immediately discarded; only metadata (model, token counts, timestamps) is recorded.
+
+For the most part this is achieved not by policy but by the absence of code paths: there is no document-upload endpoint, no key-storage endpoint, and no code that writes prompt or response bodies to disk, database, or logs. The one component that does touch content — the platform gateway relay — is a streaming passthrough: it forwards bytes to the provider and never buffers them to storage.
+
+Encrypted work product is a separate promise and a stronger one: the keys are derived from your own security key, we hold no part of them, and the code that handles them is published as a signed digest anyone can check. See [Encryption keys](#encryption-keys-yours-not-ours) and [Verifying the code](#verifying-the-code-not-just-the-keys), both of which state their limits rather than leaving them to be discovered.
+
+## Four layers of zero-knowledge
+
+<Steps>
+  <Step title="Auth layer — identity and subscription only">
+    Google or Microsoft OAuth 2.0 confirms the user's identity. The backend issues a JWT and tracks which tier they are on. That is all it knows about them.
+  </Step>
+  <Step title="Processing layer — all client-side">
+    Document text extraction, chunking, embedding, analysis, drafting, and redlining all run in the browser. The OOXML of the open Word document is read via `Word.run()` and never transmitted.
+  </Step>
+  <Step title="API layer — direct user → AI provider, or thin relay">
+    With BYOK, requests are made from the browser straight to OpenAI, Anthropic, Google, or OpenRouter, authenticated by the user's own key — the inchambers backend is not in the path at all. Free and platform-tier users route through the platform gateway instead: a thin relay that streams the request to the provider and the response back without persisting either.
+  </Step>
+  <Step title="Storage layer — billing and metadata">
+    PostgreSQL holds email, name, tier, organization, audit entries, and Stripe references. It does not hold documents, prompts, keys, responses, templates, clauses, or client data.
+  </Step>
+</Steps>
+
+## What is stored vs. what is not
+
+<CardGroup cols={2}>
+  <Card title="Server stores" icon="circle-check">
+    Email, name, tier, organization membership, subscription status, Stripe customer ID, usage counts (for rate limiting), audit events, and opt-out usage telemetry (module usage, timings, redacted error metadata).
+  </Card>
+  <Card title="Server never stores" icon="circle-xmark">
+    AI provider API keys, documents or excerpts, prompts, AI responses, templates, clause libraries, client information (CRM data), chat history, RAG vectors, analysis results.
+  </Card>
+</CardGroup>
+
+## Usage telemetry
+
+Two tiers, and the difference between them is *where the data lives*, not how much we trust it.
+
+### Baseline (every user, on by default, opt-out)
+
+Metadata only, sent to inchambers: which module was opened, how long an operation took, which model and mode a request used, token counts, and **what failed**. Failures are recorded deliberately — an error nobody reports is an error nobody fixes.
+
+Error text is the one realistic way document content leaks into a metadata pipeline (provider errors routinely echo the offending input, and a V8 stack trace repeats the message on its first line). So the client **redacts before sending**: quoted spans, file paths, emails, keys, tokens and long digit runs are stripped, the stack header is reduced to the error class, and the server additionally allow-lists both event names and property keys, dropping anything else rather than storing it.
+
+Never collected at this tier: document text, prompts, AI responses, filenames, client or matter names.
+
+Turn it off under **Settings → Preferences → Share usage data**. When off the client makes **no telemetry network calls at all** — nothing is sent and discarded server-side. Consent also fails closed: if the preference cannot be read, nothing is sent.
+
+### Deep (firm-hosted gateway only, off unless the firm turns it on)
+
+A firm running its own gateway may enable richer capture — including prompts and responses — to help diagnose its own usage. That data is written to **the firm's own Postgres on the firm's own box**, under the same reasoning as meeting transcripts below: the gateway is infrastructure the firm already controls, so this keeps the content inside a boundary the firm already owns.
+
+It is **never forwarded to inchambers**. We receive aggregate counters only (requests by model, latency, error counts, active users). If a firm wants us to see a specific incident, they export a bundle, review exactly what it contains, and send it — a push they control, never a pull we can make. Retention is configurable on their box and they can purge it at any time.
+
+The deep tier is compiled out of the platform gateway binary entirely, so content-bearing capture is structurally impossible on inchambers-run infrastructure rather than merely switched off.
+
+## Three trust zones
+
+The original model had only two places to put sensitive work: the inchambers server (off-limits — zero-knowledge) and the user's own device (client-side processing, the desktop companion). The firm-hosted **enterprise gateway** introduces a third zone — *firm-owned* infrastructure — that changes where sensitive work can live **without** weakening the inchambers promise.
+
+<CardGroup cols={3}>
+  <Card title="inchambers server" icon="building">
+    **Zero-knowledge, always.** Identity, tier, billing, audit metadata only. Never documents, prompts, responses, keys — in *every* deployment shape below.
+  </Card>
+  <Card title="User device (client-side)" icon="laptop">
+    **The default for individuals.** All document processing, encryption keys, BYOK keys, chat history, RAG vectors stay on the device (browser IndexedDB / desktop companion). No gateway is ever resolved for personal domains.
+  </Card>
+  <Card title="Firm gateway (firm-owned)" icon="shield-halved">
+    **Enterprise only.** A single-tenant relay the firm runs in its *own* cloud/on-prem, resolved by convention (`gateway.<company.com>`). Holds provider credentials, PMA records, and audit **server-side in the firm's own Postgres** — never inchambers'.
+  </Card>
+</CardGroup>
+
+**The key invariant:** relocating work to the gateway moves the sensitive boundary from *each attorney's laptop* to *the firm's own server* — it does **not** move it to inchambers. inchambers stays zero-knowledge in both the individual (client-side) and enterprise (firm-server-side) shapes. The architecture therefore bifurcates by tier:
+
+- **Individuals / personal domains** → client-side + local (`getGatewayUrl()` returns `null`; nothing changes).
+- **Enterprise firms with a gateway** → firm-owned server-side, which is usually *better* than per-laptop (shared credentials, central audit, always-on automation) while keeping inchambers blind.
+
+This third zone is the foundation for moving always-on or firm-shared work (practice-management data, pipeline automation, firm memory/precedent) off the individual device onto firm-controlled infrastructure — see the gateway architecture docs.
+
+<Note>
+**The platform gateway is a transit zone, not a storage zone.** For free and platform-tier users who have no BYOK key and no firm gateway, requests route through inchambers' own pooled relay (`gateway.inchambers.ai`). This is the one path where content touches inchambers infrastructure — but it is a streaming passthrough: bytes are forwarded to the AI provider and the response streamed back, never buffered to disk, database, or logs. The only thing persisted is per-request **metadata** (user id, model, provider, token counts, latency, timestamp) for quota and billing. No documents, prompts, or responses are stored.
+</Note>
+
+## Encryption keys: yours, not ours
+
+Work product is encrypted client-side before it leaves the device. That was
+always true, and on its own it was never the guarantee it sounded like, because
+until the passkey rollout **inchambers derived the keys**. The storage being
+blind protected you from your own storage provider, and from us not at all.
+
+Three separate paths carried that flaw, and all three are now closed.
+
+### The key comes from your own security key
+
+Your half of the encryption key is 32 random bytes generated in your browser and
+never sent anywhere in the clear. It is stored only as a wrap: encrypted under a
+secret your passkey or security key derives (WebAuthn's PRF extension), which
+never leaves that hardware.
+
+```
+user_half   32 random bytes, generated in your browser
+wrap_i      AES-GCM(user_half) under HKDF(PRF_i)   one per enrolled authenticator
+
+firm users:  DEK = HKDF(user_half || firm_half, salt = org_id,
+                        info = "ic-sync-dek-v3:" + user_id)
+solo users:  DEK = HKDF(user_half, salt = user_id, info = "ic-drive-dek-v2")
+```
+
+Each authenticator gets its own wrap of the **same** secret, which is what lets a
+laptop and a YubiKey open the same records. Adding a device re-wraps it; losing
+one revokes a wrap, not the key.
+
+Firm users keep their wraps on their own gateway. Solo practitioners have no
+gateway, so theirs sit on ours. That is still zero-knowledge: a wrap is
+ciphertext under a key only your authenticator can produce, so holding it is not
+remotely the same as holding the key.
+
+<Note>
+**Security keys cannot be used inside Word.** The taskpane is a cross-origin
+frame Microsoft Office controls, and browsers require the embedding page to
+permit WebAuthn. Office does not, and we cannot change that. Enrol in a browser
+window; afterwards Word uses the key automatically, from a device-local copy
+that cannot be exported.
+</Note>
+
+### Shared firm content
+
+A template one lawyer publishes has to open for the whole firm, so it cannot be
+keyed on anyone's personal half. One random firm secret is generated in the
+first member's browser and wrapped to each member's public key, so a colleague
+can be enrolled while they are asleep. The gateway distributes the firm's shared
+key without being able to read a byte of what it protects.
+
+### Recovery, and what it costs
+
+<Warning>
+**There is no vendor-side recovery, by design.** We cannot reset your key, because
+we do not have it. If you lose every enrolled authenticator and your firm has no
+break-glass key, the records encrypted under it are unreadable permanently.
+</Warning>
+
+Firms set up a **break-glass key** whose private half is generated in an admin's
+browser and never sent to the gateway, so a stolen gateway database cannot open
+the escrow copies. Solo practitioners have nobody to escrow to but us, and an
+inchambers-held copy would restore exactly the access this removes, so they are
+told plainly to enrol a second key.
+
+Existing history is **not** re-encrypted under the new key until losing one
+authenticator is survivable: either the half is escrowed to the firm, or a second
+authenticator is enrolled. Until then it stays on the older key, which is weaker
+against us and stronger against accident. For records that cannot be recreated,
+that is the right way round.
+
+## Verifying the code, not just the keys
+
+Removing ourselves from key custody leaves one problem untouched: the browser
+holding those keys runs JavaScript we serve. A bundle modified for one firm would
+have every key in hand at runtime, and no key design fixes that.
+
+Nothing can make that impossible. What can be made impossible is doing it
+**quietly**.
+
+Every client release is published as a SHA-256 digest of every file the browser
+loads, signed with a keyless certificate and recorded in the public Sigstore
+transparency log, which is append-only and which we cannot edit. Two things then
+follow:
+
+- **Anyone can check a live deployment**, with no account:
+  ```
+  node scripts/verify-client-release.js --origin https://app.inchambers.ai
+  ```
+  It fetches what the origin actually serves and compares it to what was
+  published. A mismatch is what serving one customer modified code looks like
+  from outside.
+
+- **A firm's own gateway checks continuously.** It pins the published digest,
+  fetches the live bundle itself from its own network position, and refuses to
+  release its half of the encryption key to a client build that is not the
+  published release. A signature proves what we published; the gateway's own
+  fetch is what says something about what we served *you*.
+
+The build is reproducible: CI builds each release twice and refuses to publish
+if the two differ, so a third party can rebuild the tag and confirm the digest.
+
+### What this does not cover
+
+We would rather state the limits than have a reviewer find them.
+
+- **It proves consistency, not honesty.** A pass means you were served the
+  published bytes, and therefore the same bytes as everyone else. It says nothing
+  about whether those bytes are honest. That is what auditing the source is for,
+  and the two claims must not be run together.
+- **A bundle that lies about its own build id** defeats the gateway's per-user
+  check, and an origin serving honest code to a gateway's IP and modified code to
+  a browser defeats the fetch. The honest claim is that a targeted build cannot
+  be delivered *quietly*, not that it cannot be delivered.
+- **inchambers builds the gateway images.** They are cosign-signed and
+  license-gated, but a malicious update could exfiltrate the firm half. The
+  honest statement is "inchambers cannot decrypt without shipping you code that
+  betrays you", which is the trust model of any on-premises vendor.
+- **Client-side compromise is unaffected.** Script injection in a browser has the
+  keys at runtime; non-extractable keys prevent exfiltration of a key, not its
+  use.
+- **Older gateways** answer 404 for the firm half and continue on the previous
+  two-party key. The client refuses to *downgrade*: an unreachable or broken
+  gateway stalls sync rather than silently reverting.
+
+## Cross-device sync (firm gateway only)
+
+Once a firm gateway resolves, work product roams between a lawyer's devices through it. This is **on by default** for firm-gateway users and switched off in Settings; it never runs for individuals or personal domains, because sync requires a firm gateway to exist.
+
+**What syncs:** chat history, analyses, generated artifacts, templates, clauses, playbooks, email signatures, bookmarks, tab groups, review grids and comments, and the solo practice-management records (matters, clients, dockets) — 21 record kinds in all.
+
+**What does not:** document *bytes*. No sync handler touches the encrypted file store, so only pointers and names travel. Also excluded: API keys, preferences, MCP servers, review cells, and document checks.
+
+Synced records are a **roaming copy**: each device keeps its own authoritative store, so losing the gateway costs roaming rather than work product.
+
+If a gateway starts with synced rows present but no key, it **will not mint a replacement**, because generating a fresh one would make the surviving history permanently unreadable rather than recovering it. It logs the reason, lets sync fail closed, and the admin console offers the restore path.
+
+## Encryption
+
+### In transit
+
+TLS 1.2+ on every connection. Cloudflare sits in front of the AWS EC2 origin (orange-cloud proxy), providing an additional TLS termination layer.
+
+### At rest, client-side
+
+AES-256-GCM via the WebCrypto API. The encryption key is a **non-extractable** `CryptoKey` object stored in IndexedDB. Even an attacker with XSS on the origin cannot exfiltrate the raw key material — they can only call encrypt/decrypt while their code is active, which limits blast radius and leaves traces.
+
+### Encrypted fields
+
+| Field | Where | Notes |
+|-------|-------|-------|
+| API keys | `secureStorage.ts` → `apiKeys` store | Every provider key is encrypted individually. |
+| Chat history | `chatHistoryManager.ts` | Messages, tool calls, model responses. |
+| Analysis results | `secureStorage.ts` → `analyses` | All five analysis modules. |
+| RAG vectors | `InChambersVectors` DB | Content and section title encrypted; Float32Array vectors stored unencrypted for linear algebra. |
+| Templates | `secureStorage.ts` → `templates` | Text and metadata. |
+| Clauses | `secureStorage.ts` → `clauses` | Including playbook-curated clauses. |
+| MCP servers | `secureStorage.ts` → `mcpServers` | Tokens for connected integrations. |
+| Review grid cells | `secureStorage.ts` → `reviewCells` | Extracted values and the quoted source spans behind them. |
+
+## Client-side storage map
+
+Two IndexedDB databases:
+
+<AccordionGroup>
+  <Accordion title="secureStorage.ts (version 21)">
+    Object stores: `apiKeys`, `preferences`, `history`, `analyses`, `encryptionKeys`, `cloudStorage`, `mcpServers`, `templates`, `clauses`, `syncQueue`, `orgTemplates`, `orgClauses`, `orgPlaybooks`, `generations`, `orgGenerations`, `bookmarks`, `orgBookmarks`, `reviewGrids`, `reviewCells`, `reviewComments`, `documentChecks`. All sensitive fields AES-256-GCM encrypted.
+  </Accordion>
+  <Accordion title="InChambersVectors">
+    Dedicated store for RAG embeddings. Content and section title are encrypted; the `Float32Array` vector itself is stored unencrypted because cosine similarity requires the raw numeric data.
+  </Accordion>
+</AccordionGroup>
+
+Shared helpers live in `src/utils/`: `historyStorage.ts`, `chatHistoryManager.ts`, `encryptionService.ts`.
+
+## Firm access control & shared memory (enterprise gateway)
+
+For firms running a self-hosted gateway, PMA data (clients, matters, time entries) is no longer org-wide-readable. A **need-to-know access model** is enforced **server-side on the firm's own gateway** — using the non-forgeable `org_id` + `sub` claims from the inchambers JWT (never client-supplied):
+
+| Concept | Rule |
+|---------|------|
+| Roles | 11 seniority tiers (Admin … Intern) grant *capabilities* (`view`, `edit`, `manage_team`, `originate`, `manage_roles`, `firm_wide_view`, `bill`, `manage_trust`). |
+| Matter visibility | A member sees only matters they are attached to (matter-team membership, responsible/originating attorney, or task assignee). Admins + firm-wide-view roles see all. |
+| Out-of-scope access | Returns **404, not 403** — the gateway never reveals that a matter a user can't see exists. |
+| Default | Enforcement is **OFF by default**; an org admin assigns roles and enables it. Until then behaviour is unchanged. |
+
+**Firm memory** (the compounding-context loop) and the **precedent corpus** inherit the same ACL: a recall/search returns only `firm-general` entries (de-identified clause/drafting patterns) ∪ entries for matters the caller may see. Matter-confidential findings never leave the need-to-know set. The post-analysis write-back is conservative — `matter-confidential` by default, never raw client text, and the firm-shared pool only accepts findings attributable to a matter.
+
+**Firm-wide reads are capability-scoped, not just view-gated.** A few tools return firm-wide data that has no matter to scope on (accounting customers, vendors, rate cards, trust accounts). On the AI/tool surface (the MCP server, the server-side tool loop, and the email associate) these require the caller's actual `bill` / `manage_trust` capability, enforced at the single `call_tool_guarded` chokepoint — so an associate cannot harvest the firm's books through an AI tool. Firm **economics** in settings (per-grade and per-timekeeper cost rates, billable-hours targets) are redacted from `get_settings` unless the caller clears the same seniority bar the analytics module uses, closing a gap where any view-capable member could read cost figures. Member rosters expose names for assignment but redact emails unless the caller holds an elevated (`manage_team` / `manage_roles` / `firm_wide_view`) capability.
+
+**Matter isolation is enforced in SQL and proven by tests.** The precedent search pushes the ACL boundary into the query itself — every dense, sparse, and legacy leg carries `access_class = 'firm-general' OR ($caller_is_firm_wide AND matter_id IS NOT NULL) OR (matter_id = ANY($caller_scope))`, so a matter's confidential chunks are never even fetched for a caller outside its need-to-know set (no over-fetch-then-discard). An in-Rust `chunk_visible()` filter runs as a second, defense-in-depth gate, and a unit test exhaustively asserts the SQL predicate and the Rust filter decide identically across every `(access_class, matter_id, scope)` case — so the boundary cannot silently drift under refactor. The matter-memory graph enforces the same boundary directly in its recall `WHERE matter_id = $caller_matter` clause, returning an empty set (never a 403) for an out-of-scope matter. The index write path refuses to store a `matter-confidential` chunk that has no `matter_id` or names a matter the writer can't see (reported back as `skipped`, never silently accepted), closing the "invisible-to-everyone" mis-write foot-gun; an optional per-firm `acl_audit` setting logs every such drop for leak detection.
+
+**Keyless embeddings, no text egress.** Semantic precedent search runs on a **gateway-local embedding model** (Model2Vec `potion-base-8M`, 256-dim, pure-Rust) that executes on the firm's own gateway — no embedding API key, and document text used to build the corpus never leaves the firm's box. (Anthropic has no embeddings endpoint, which is precisely why the gateway runs its own model rather than calling a provider.) Embeddings are stored as plain float arrays and compared by cosine similarity in Rust — no pgvector — and only vectors of equal dimension are ever compared.
+
+**Individuals without a gateway** stay fully client-side: memory lives in the per-user IndexedDB knowledge graph, and embeddings come from the local desktop daemon (384-dim) or the user's own BYOK key (OpenAI 1536 / Google 768). Nothing is shared, nothing is server-side.
+
+**The email paralegal ("hobbit")** runs on the firm's own gateway and acts strictly **as the requesting lawyer** (it is an AI paralegal, not a licensed attorney, and never holds itself out as one): a lawyer emails the firm's licensed paralegal mailbox, and every tool call the paralegal makes is evaluated against that lawyer's own capabilities and need-to-know matter scope (minus ethical walls) — the same server-side ACL as above, driven by a synthesized identity resolved from the DMARC-verified sender who must also be a valid inchambers seat (verified centrally). So one lawyer's paralegal can never surface another lawyer's walled matters, and firm-wide financial/roster tools are withheld unless the lawyer holds the matching capability (`bill` / `manage_trust` / `firm_wide_view`). The paralegal only ever reads its own mailbox and only ever replies to the original sender — it cannot read other users' inboxes or send elsewhere. Before it sends, it **verifies every legal authority it relied on** against the case-law sources (tiered by authority, with an authoritative SCC Online check routed through the firm's own designated desktop) and appends an "Authorities checked" ledger; this preserves zero-knowledge because only the **public citation string** (a case reference, not client content) is ever sent to a source. For a substantial task it can also **propose a plan first** and wait for the lawyer to confirm or adjust it before doing the work, with the exchange carried entirely over the email thread.
+
+**Server-side OCR** (scanned/image documents, incl. Indian scripts) runs on the **firm gateway only**, via an on-box model (RapidOCR/PP-OCRv5) the firm hosts itself. It is compiled out of the platform-gateway binary entirely, so a document is **never** OCR'd on inchambers infrastructure — the zero-knowledge boundary holds. Individuals with no firm gateway keep using client-side OCR (Tesseract.js / the desktop daemon).
+
+**Server-side diligence-grid extraction** (a review's N documents by M extraction columns) runs on the **firm gateway only**, off by default, and an org admin must turn it on. It exists because the client-side path is bounded by one laptop's ability to issue hundreds of large-context requests; a firm that already runs its own gateway can hand the batch to that box instead. Compiled out of the platform-gateway binary entirely, so a document is **never** extracted on inchambers infrastructure. Only documents filed to a matter are eligible: the gateway fetches each one itself and authorises it against the caller's own matter scope (via the same `accessible_matter_ids` chokepoint as every other matter read, ethical walls included) **before** downloading, and an out-of-scope row 404s the whole request rather than confirming which matter ids exist. Extracted text lives only for the duration of one document's call, results are held in memory and pulled by the client rather than written to the firm's Postgres, and the client remains the system of record. That memory is bounded rather than merely transient: a background sweeper drops a job's results a minute after the client has collected them, fifteen minutes after it finishes if the client never comes back, and cancels plus drops anything nobody has polled for ten minutes. Previously the sweep ran only when some later request happened to trigger it, so an idle gateway held extracted content until it restarted. One member may also hold only one server-side run at a time, so a firm's concurrent slots cannot be monopolised. Individuals with no firm gateway keep using the browser path, which is the default for everyone.
+
+**Watched citations** are the smallest of these flows and worth stating anyway, because it is a new kind of record rather than a smaller one. When a user watches an authority so they are told if it stops being good law, the watch is mirrored to the **firm gateway only** (`citation_watches`, migration 068) so a background sweep can re-check it while the browser is closed, which is the entire point: an authority relied on in August was probably watched in March and nobody re-opened it. The row holds the **public citation string**, its jurisdiction, and the treatment the user was last told. It holds no document text, no proposition, no matter linkage, and nothing about why the authority was cited. The citation is the part that was always going to leave the machine, since looking it up is what a citator does. It is compiled out of the platform-gateway binary entirely, so inchambers infrastructure never learns which authorities a lawyer is tracking; individuals with no firm gateway keep the client-side re-check that runs when the app opens, and lose nothing they had before. Notifications are per-user, and a treatment change alerts once on the transition rather than on every sweep.
+
+**Teams meeting transcripts** are the one work-product type stored as raw content rather than encrypted client-side, and they are stored **only on the firm's own gateway** (`meeting_call_records`), never on inchambers infrastructure — the pipeline is compiled out of the platform-gateway binary. The firm's Microsoft tenant already holds the same transcript; the gateway is the firm's own box, so this keeps the content inside the boundary the firm already controls. Summarization runs through the firm's own AI provider. Access is need-to-know, not firm-wide: a transcript filed to a matter is readable only by users who can see that matter (ethical walls included), and an unfiled transcript only by the call's organizer and attendees, matched on participant email. Out-of-scope reads return 404 rather than 403, so the API cannot be used to confirm a meeting exists. Transcripts are deletable per record (`DELETE /api/meetings/:id`); firms with a retention policy should purge on their own schedule, as there is no automatic expiry.
+
+**Signing keys for tamper-evident exports are the one asymmetric-key rail, and inchambers holds no private half of it.** An evidence bundle (see [Tamper-Evident Exports](/architecture/tamper-evident-exports)) carries SHA-256 digests anyone can check plus an optional Ed25519 signature. For an individual, that keypair is generated in the browser as a **non-extractable** `CryptoKey` and the private half never leaves the device, so we cannot sign on a user's behalf and cannot be compelled to; we store and serve only the **public** half (`user_signing_keys`, migration 100), which is not content. For a firm with its own gateway, the key sits on the firm's own box and the signing route is compiled out of the platform-gateway binary entirely, so signing capability does not exist on inchambers-run infrastructure. Bundles are assembled and hashed client-side, so producing chain-of-custody material over client documents uploads nothing; the firm signing endpoint receives one hex digest, returns one signature, and does not log the digest.
+
+## WASM IP protection
+
+The Rust/WASM module contains business logic (classification, routing, prompt composition), but **not** the prompts themselves. Proprietary strings — system prompts, few-shot examples, regex patterns, playbook clauses, intent classifiers — are held in the encrypted prompt vault (see [Prompt Vault](/architecture/prompt-vault)).
+
+A curious attacker running `strings` on the `.wasm` binary will find only opcode names and empty prompt-key placeholders.
+
+## Threat model
+
+| Threat | Mitigation |
+|--------|------------|
+| Server-side key theft | The zero-knowledge backend holds no user provider keys. Pooled subscription tokens (platform gateway) and firm credentials (firm gateway) live only on the respective gateway, never on app.inchambers.ai, and are minted/cached in memory rather than exposed to clients. |
+| Server-side document leak | There are no documents on **inchambers** infrastructure, in any deployment shape. A firm that switches on its own gateway's OCR, precedent corpus, meeting transcripts or grid extraction places that content on **its own** box, inside a boundary it already controls, and each of those paths is compiled out of the platform-gateway binary. |
+| XSS on origin | Non-extractable CryptoKey — attacker can decrypt while active but cannot exfiltrate key. |
+| Compromised npm dependency | Client-side encryption still applies; dependency cannot bypass CryptoKey constraints. |
+| WASM reverse-engineering | Prompt vault is AES-256-GCM encrypted; only WASM can decrypt at runtime. |
+| Forged export attributed to a user | Signing keys are non-extractable and device-held (or firm-gateway-held); inchambers holds no private key and so cannot mint a signature in anyone's name. |
+| Altered evidence bundle | SHA-256 per document plus a root digest over the canonical manifest; a signature covers the root, so any edit to a document, a digest, or the provenance invalidates it. |
+| Stripe webhook replay | Webhook signature verification; idempotent handlers. |
+
+## Compliance surface
+
+| Framework | Applicable coverage |
+|-----------|---------------------|
+| GDPR | Right to erasure (DELETE /api/user); data minimization (identity + billing only). |
+| CCPA | California consumer rights; no sale of personal information. |
+| PIPEDA | Canadian privacy compliance. |
+| Indian IT Act | Indian data protection. |
+| SOC 2 | Organizational controls on the hosted backend. |
+| HIPAA | No PHI processed server-side — all content stays on client. |
+| FedRAMP | Supported via a firm-hosted gateway running in the firm's own compliant environment. |
+
+The enterprise path (a firm-hosted single-tenant gateway, resolved by convention as `gateway.<company.com>`) is the mechanism for organizations whose compliance regime requires AI credentials, audit, and practice-management data to live inside their own infrastructure. It replaces the earlier customer-deployed Azure Function / GCP key-distribution model, which has been removed.
